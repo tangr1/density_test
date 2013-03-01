@@ -1,0 +1,5 @@
+test: value
+
+load_setting: dummy
+credential: dummy
+output_dir: dummy

@@ -1,0 +1,9 @@
+GEM
+  specs:
+    uuidtools (2.1.3)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  uuidtools

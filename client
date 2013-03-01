@@ -1,0 +1,242 @@
+#!/usr/bin/env ruby
+
+$:.unshift File.dirname(__FILE__)
+require "yajl"
+require "curb"
+require "yaml"
+require 'optparse'
+require 'net/ssh'
+require 'net/scp'
+require 'fileutils'
+require 'terminal-color'
+require 'uuidtools'
+require "redis"
+require "logger"
+require 'eventmachine'
+require 'nats/client'
+
+require 'redis_sqlite.rb'
+
+PACKAGE_DIR = '/var/vcap/data/density_test'
+TMP_CONFIG_DIR = '/tmp/density_tmp'
+LOCAL_OUTPUT = File.join(File.dirname(__FILE__), "output")
+
+$config = YAML.load_file(File.expand_path("../config.yml", __FILE__))
+$package_config = YAML.load_file(File.expand_path("../package_config.yml", __FILE__))
+$ssh_user = $config["ssh"]["user"]
+$ssh_pass = $config["ssh"]["pass"]
+FileUtils.mkdir_p(LOCAL_OUTPUT)
+
+def get_config
+  p $config
+end
+
+def load_vms
+  list_file = File.expand_path("../.dea_list", __FILE__)
+  unless File.exist?(list_file)
+    bosh_config = YAML.load_file(File.expand_path("~/.bosh_config"))
+    target = bosh_config["target_name"]
+    puts "Getting VMs info...".green
+    `bosh vms #{target}|grep dea|awk '{print $8}' > .dea_list`
+  end
+  ret = []
+  File.open(list_file).lines do |line|
+    ret << line.strip
+  end
+  ret
+end
+$vms = load_vms
+
+def upload
+  $vms.each do |ip|
+    puts "Uploading to #{ip}"
+    Net::SSH.start(ip, $ssh_user, {:password => $ssh_pass}) do |ssh|
+      ssh.exec!("mkdir -p #{TMP_CONFIG_DIR}")
+      ssh.exec!("mkdir -p #{$config['output_dir']}")
+      ssh.scp.upload!(File.expand_path("../package", __FILE__), PACKAGE_DIR, :recursive => true)
+    end
+  end
+end
+
+def pick_load(ind, total, app_load)
+  app_load.each do |type, setting|
+    if ind <= total * setting["ratio"].to_i / 100
+      return [type, setting]
+    end
+    ind -= total * setting["ratio"].to_i / 100
+  end
+  return nil
+end
+
+def start
+  threads = []
+  $config["nodes"].each do |name, ip|
+    threads << Thread.new(name, ip) do |t_name, t_ip|
+      plan = t_name.split(/_/)[-2].to_i
+      app_load = $config["load"][plan]
+      local_db = "sqlite:" + File.join($config["local_db_dir"], "#{t_name}.db")
+      creds = load_sqlite(local_db, t_ip)
+      count = 0
+      creds.each do |cred|
+        count += 1
+        type, load_setting = pick_load(count, creds.size, app_load)
+        break unless type
+
+        t_package_config = $package_config.dup
+        t_package_config["load_setting"] = load_setting
+        output_dir = t_package_config["output_dir"] = File.join($config["output_dir"], t_name)
+        t_package_config["credential"] = cred
+        dea_ip = $vms[(count - 1) % $vms.size]
+        pconfig_path = File.join(TMP_CONFIG_DIR, UUIDTools::UUID.random_create.to_s + ".yml")
+
+        instance_name = t_package_config["credential"]["name"]
+        puts "Starting #{type} app #{count} on #{dea_ip}, node is #{name}, instance is #{instance_name}"
+        Net::SSH.start(dea_ip, $ssh_user, {:password => $ssh_pass}) do |ssh|
+          ssh.exec!("mkdir -p #{output_dir}")
+          ssh.exec!("echo '#{t_package_config.to_yaml}' > #{pconfig_path}")
+          #ssh.exec!("cd #{PACKAGE_DIR}/package; nohup /var/vcap/bosh/bin/bundle exec ./app.rb -c #{pconfig_path} start &")
+          puts ssh.exec!("BUNDLE_GEMFILE=#{PACKAGE_DIR}/package/Gemfile /var/vcap/bosh/bin/bundle exec #{PACKAGE_DIR}/package/app.rb -c #{pconfig_path} start")
+        end
+      end
+    end
+  end
+  threads.each {|t| t.join}
+end
+
+def stop
+  $vms.each do |ip|
+    puts "Stopping on #{ip}"
+    Net::SSH.start(ip, $ssh_user, {:password => $ssh_pass}) do |ssh|
+      ssh.exec!("cd #{PACKAGE_DIR}/package && /var/vcap/bosh/bin/bundle exec ./app.rb stop")
+      ssh.scp.download!("#{$config['output_dir']}", LOCAL_OUTPUT, :recursive => true)
+    end
+  end
+end
+
+def clean(delete_package=false)
+  $vms.each do |ip|
+    puts "Cleaning on #{ip}"
+    Net::SSH.start(ip, $ssh_user, {:password => $ssh_pass}) do |ssh|
+      ssh.exec!("rm -rf #{TMP_CONFIG_DIR}/*")
+      ssh.exec!("rm -rf #{$config['output_dir']}/*")
+      ssh.exec!("rm -rf #{PACKAGE_DIR}/*") if delete_package
+    end
+  end
+end
+
+def clean_all
+  clean(true)
+  FileUtils.rm_rf(LOCAL_OUTPUT)
+end
+
+def local_db
+  $config["nodes"].each do |name, ip|
+    puts "Copy local db from node to #{ip}"
+    Net::SSH.start(ip, $ssh_user, {:password => $ssh_pass}) do |ssh|
+      ssh.scp.download!("/var/vcap/store/redis/redis_node.db", $config["local_db_dir"])
+    end
+    FileUtils.mv(File.join($config["local_db_dir"], "redis_node.db"), File.join($config["local_db_dir"], "#{name}.db"))
+  end
+end
+
+def preload
+  $config["nodes"].each do |name, ip|
+    plan = name.split(/_/)[-2].to_i
+    data_size = 5 if plan == 100
+    data_size = 100 if plan == 250
+    sqlite_db = File.join($config["local_db_dir"], "#{name}.db")
+
+    # calculate the insert count in db; insert 10K per record
+    record_count = data_size * 100
+    record_content = "a" * 10000
+    records = `sqlite3 #{sqlite_db} "select password, port from vcap_services_redis_node_provisioned_services"`
+
+    tids = []
+    records.split("\n").each do |record|
+      password, port = record.split('|')
+      redis = Redis.new({:host => ip, :port => port, :password => password})
+      if redis
+        tid = Thread.new do
+          record_count.times do
+            key = UUIDTools::UUID.random_create.to_s
+            redis.setnx(key, record_content)
+          end
+        end
+        tids << tid
+      end
+    end
+    tids.each do |tid|
+      tid.join
+    end
+
+    records.split("\n").each do |record|
+      password, port = record.split('|')
+      redis = Redis.new({:host => ip, :port => port, :password => password})
+      begin
+        p redis.info["used_memory_human"]
+      rescue => e
+      end
+    end
+  end
+end
+
+def provision
+  node = ARGV[1]
+  plan = node.split(/_/)[-2]
+  count = ARGV[2].to_i
+  (1..count).each do
+    EM.run do
+      node_nats = NATS.connect(:uri => $config["nats"]) do
+      end
+      subscription = node_nats.request("RaaS.provision.#{node}", "{\"plan\":\"#{plan}\",\"version\":\"2.6\"}") do |msg|
+        p msg
+        EM.stop
+      end
+    end
+  end
+end
+
+def unprovision
+  node = ARGV[1]
+
+  sqlite_db = "./local_db/#{node}.db"
+  records = `sqlite3 #{sqlite_db} "select name, ip from vcap_services_redis_node_provisioned_services"`
+
+  records.split("\n").each do |record|
+    EM.run do
+      name, ip = record.split('|')
+      node_nats = NATS.connect(:uri => $config["nats"]) do
+      end
+      request = {
+        "name" => name,
+        "bindings" => []
+      }
+      subscription = node_nats.request("RaaS.unprovision.#{node}", JSON.generate(request)) do |msg|
+        p msg
+        EM.stop
+      end
+    end
+  end
+end
+
+def response_time
+  puts "                 \tcount\ttotal time\taverage time"
+  Dir.foreach("./output/logs") do |entry|
+    next if entry == "." || entry == ".."
+    logs_dir = File.join("./output/logs", entry)
+    count = 0.0
+    time = 0.0
+    Dir.entries(logs_dir).each do |file_name|
+      next if file_name == "." || file_name == ".."
+      file = File.join(logs_dir, file_name)
+      a = %x[tail -n 1 #{file} | cut -d" " -f4].to_f
+      if a > 1
+        count = count + 1
+        time = time + %x[tail -n 1 #{file} | cut -d" " -f4].to_f
+      end
+    end
+    puts "#{entry}:\t#{count}\t#{time.round(2)}\t\t#{(time / count).round(2)}"
+  end
+end
+
+send(ARGV[0].to_sym)
